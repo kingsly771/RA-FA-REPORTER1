@@ -14,6 +14,8 @@ import random
 import string
 from time import sleep
 from multiprocessing import Process
+from threading import Thread
+from queue import Queue
 
 # ─── Dependency Check ────────────────────────────────────────────────────────
 
@@ -117,11 +119,6 @@ def get_user_agent():
     return random.choice(USER_AGENTS)
 
 
-def random_str(length):
-    letters = string.ascii_lowercase + string.ascii_uppercase + string.digits
-    return ''.join(random.choice(letters) for _ in range(length))
-
-
 def chunks(lst, n):
     """Yield successive n-sized chunks from lst."""
     for i in range(0, len(lst), n):
@@ -129,7 +126,7 @@ def chunks(lst, n):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PROXY HARVESTER
+# PROXY HARVESTER — FAST MODE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 PROXY_SOURCES = [
@@ -146,8 +143,27 @@ PROXY_SOURCES = [
 ]
 
 
+def _test_http_proxy(proxy, result_queue):
+    """Quick single-proxy test — runs in thread."""
+    ua = get_user_agent()
+    try:
+        s = Session()
+        s.proxies = {"http": "http://" + proxy, "https": "http://" + proxy}
+        s.headers.update({"User-Agent": ua, "Connection": "close"})
+        # Just check if we can connect — use short timeout
+        resp = s.get("http://connectivitycheck.platform.hadielkadi.com/generate_204",
+                     timeout=3, allow_redirects=False)
+        if resp.status_code in (200, 204, 302, 301):
+            result_queue.put(proxy)
+            print_success("Proxy: " + proxy)
+        else:
+            result_queue.put(None)
+    except:
+        result_queue.put(None)
+
+
 def find_proxies():
-    """Fetch proxies from multiple online sources."""
+    """Fetch proxies from multiple online sources — fast threaded validation."""
     proxy_set = set()
     ua = get_user_agent()
 
@@ -155,7 +171,7 @@ def find_proxies():
 
     for url in PROXY_SOURCES:
         try:
-            resp = rget(url, headers={"User-Agent": ua}, timeout=10)
+            resp = rget(url, headers={"User-Agent": ua}, timeout=8)
             if resp.status_code != 200:
                 continue
             for line in resp.text.strip().splitlines():
@@ -176,21 +192,34 @@ def find_proxies():
         print_error("No proxies found from any source!")
         return []
 
-    # Test top proxies
-    print_status("Testing proxy connectivity...")
+    # Test proxies using threads — 30 at a time
+    print_status("Testing proxies (30 concurrent threads)...")
     valid = []
+    to_test = proxy_list[:120]  # Test up to 120 proxies max
 
-    for proxy in proxy_list[:80]:
-        try:
-            s = Session()
-            s.proxies = {"http": "http://" + proxy, "https": "http://" + proxy}
-            s.headers.update({"User-Agent": ua})
-            resp = s.get("https://httpbin.org/ip", timeout=5)
-            if resp.status_code == 200:
-                valid.append(proxy)
-                print_success("Proxy working: " + proxy)
-        except:
-            pass
+    # Process in batches of 30 threads
+    for batch_start in range(0, len(to_test), 30):
+        batch = to_test[batch_start:batch_start + 30]
+        q = Queue()
+        threads = []
+
+        for proxy in batch:
+            t = Thread(target=_test_http_proxy, args=(proxy, q))
+            t.start()
+            threads.append(t)
+
+        # Wait for all threads to finish (max 5 seconds)
+        for t in threads:
+            t.join(timeout=5)
+
+        # Collect results
+        while not q.empty():
+            result = q.get()
+            if result:
+                valid.append(result)
+
+        if len(valid) >= 30:
+            break
 
     if not valid:
         print_status("No valid proxies found — using raw list.")
@@ -200,7 +229,9 @@ def find_proxies():
     if len(valid) % 5 != 0 and len(valid) > 5:
         valid = valid[:len(valid) - (len(valid) % 5)]
 
-    return valid[:50]
+    valid = valid[:50]
+    print_status("Got " + str(len(valid)) + " working proxies.")
+    return valid
 
 
 def parse_proxy_file(fpath):
@@ -475,7 +506,6 @@ def report_telegram_user(username, proxy):
         else:
             print_error("[TG] Report returned " + str(res.status_code))
 
-        # Additional profile visit for impression
         ses.get("https://t.me/" + username, headers=tg_h, timeout=10)
 
     except Exception as e:
