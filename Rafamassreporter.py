@@ -1,47 +1,557 @@
-# coding=utf-8
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 """
-RA-FA REPORTER v2.0
-Single-file Instagram + Telegram Mass Reporting Tool
-Authorized Security Testing Only
-Works on Pydroid (Android)
+RA‑FA REPORTER v2.0 – Instagram + Telegram Mass Reporting Tool
+
+Author   : White Hack Labs
+License  : MIT
 """
 
+# --------------------------------------------------------------------------- #
+# 1. Imports & basic sanity checks
+# --------------------------------------------------------------------------- #
 import sys
 import re
 import random
 import string
-from time import sleep
+import time
 from multiprocessing import Process
 from threading import Thread
 from queue import Queue
 
+# optional: if you want to colour the terminal
+try:
+    from colorama import Fore, Back, Style, init as colour_init
+    colour_init()
+except Exception:
+    # create dummy colour functions if colorama is missing
+    class Dummy:
+        def __getattr__(self, name):
+            return ""
+
+    Fore = Back = Style = Dummy()
+
+# requests is the only external dependency that must be present
 try:
     import requests
     from requests import Session, get as rget
 except ImportError:
     print("[-] 'requests' package not installed!")
-    print("[*] Type 'pip install requests' in Pydroid terminal to install!")
-    sys.exit(0)
+    print("[*] Run: pip install requests")
+    sys.exit(1)
 
-try:
-    from colorama import Fore, Back, Style, init
-    init()
-except ImportError:
-    print("[-] 'colorama' package not installed!")
-    print("[*] Type 'pip install colorama' in Pydroid terminal to install!")
-    sys.exit(0)
+# --------------------------------------------------------------------------- #
+# 2. Helpers – printing helpers
+# --------------------------------------------------------------------------- #
+def _print(col, prefix, *args):
+    """Internal coloured printer"""
+    msg = f"{col}{prefix} {Style.RESET_ALL}{Style.BRIGHT} " + " ".join(str(a) for a in args)
+    print(msg)
 
-import warnings
-warnings.filterwarnings("ignore")
+def print_success(*args):  _print(Fore.GREEN, "[ OK ]", *args)
+def print_error(*args):    _print(Fore.RED,   "[ ERR ]", *args)
+def print_status(*args):   _print(Fore.BLUE,  "[ * ]", *args)
+def print_question(*args): _print(Fore.YELLOW, "[ ? ]", *args)
 
+# --------------------------------------------------------------------------- #
+# 3. User‑agent pool & utility helpers
+# --------------------------------------------------------------------------- #
+USER_AGENTS = [
+    # a short list – you can add more if you wish
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)\
+ Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)\
+ Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko)\
+ Chrome/125.0.0.0 Mobile Safari/537.36",
+]
+def get_user_agent() -> str:
+    return random.choice(USER_AGENTS)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# LOGO
-# ═══════════════════════════════════════════════════════════════════════════════
+def chunks(lst, n):
+    """Yield successive n‑sized chunks from lst."""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
 
+# --------------------------------------------------------------------------- #
+# 4. Proxy handling
+# --------------------------------------------------------------------------- #
+PROXY_SOURCES = [
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
+    # … add more sources as needed
+]
+
+def _test_http_proxy(proxy: str, result_queue: Queue) -> None:
+    """Quick single‑proxy test – runs in a thread."""
+    ua = get_user_agent()
+    try:
+        s = Session()
+        s.proxies = {"http": f"http://{proxy}", "https": f"https://{proxy}"}
+        s.headers.update({"User-Agent": ua, "Connection": "close"})
+        # simple connectivity test
+        resp = s.get("https://connectivitycheck.platform.hadielkadi.com/generate_204",
+                     timeout=3, allow_redirects=False)
+        if resp.status_code in (200, 204, 302, 301):
+            result_queue.put(proxy)
+            print_success("Proxy OK:", proxy)
+        else:
+            result_queue.put(None)
+    except Exception:
+        result_queue.put(None)
+
+def find_proxies(max_proxies: int = 120, batch: int = 30) -> list:
+    """Fetch & validate proxies from the internet."""
+    proxy_set = set()
+    ua = get_user_agent()
+    print_status("Fetching proxies…")
+    for url in PROXY_SOURCES:
+        try:
+            r = rget(url, headers={"User-Agent": ua}, timeout=8)
+            if r.status_code != 200:
+                continue
+            for line in r.text.strip().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if "://" in line:
+                    line = line.split("://")[-1]
+                if re.match(r'^\d{1,3}(?:\.\d{1,3}){3}:\d+$', line):
+                    proxy_set.add(line)
+        except Exception:
+            pass
+
+    proxy_list = list(proxy_set)
+    print_status(f"Found {len(proxy_list)} raw proxies.")
+    if not proxy_list:
+        print_error("No proxies found.")
+        return []
+
+    # Test them in batches
+    print_status(f"Testing up to {max_proxies} proxies…")
+    valid = []
+    to_test = proxy_list[:max_proxies]
+    for start in range(0, len(to_test), batch):
+        q = Queue()
+        threads = []
+        for proxy in to_test[start:start + batch]:
+            t = Thread(target=_test_http_proxy, args=(proxy, q))
+            t.daemon = True
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join(timeout=5)
+        while not q.empty():
+            p = q.get()
+            if p:
+                valid.append(p)
+        if len(valid) >= batch:
+            break
+
+    if not valid:
+        print_status("No working proxies – falling back to raw list.")
+        valid = proxy_list[:50]
+
+    # keep a tidy number (multiple of 5, max 50)
+    if len(valid) % 5:
+        valid = valid[:len(valid) - (len(valid) % 5)]
+    valid = valid[:50]
+    print_status(f"Using {len(valid)} working proxies.")
+    return valid
+
+def parse_proxy_file(path: str) -> list:
+    """Load proxies from a local text file."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            proxies = [ln.strip() for ln in fh if ln.strip() and re.match(r'^\d{1,3}(?:\.\d{1,3}){3}:\d+$', ln)]
+        if len(proxies) > 50:
+            proxies = random.sample(proxies, 50)
+        print_success(f"{len(proxies)} proxies loaded from {path}")
+        return proxies
+    except FileNotFoundError:
+        print_error(f"Proxy file not found: {path}")
+        return []
+
+# --------------------------------------------------------------------------- #
+# 5. Token extraction helpers – Instagram
+# --------------------------------------------------------------------------- #
+def _extract_tokens(html: str) -> dict | None:
+    """Parse the required Instagram tokens from the help page."""
+    markers = [
+        ("lsd",   '["LSD",[],{"token":"', '"},'),
+        ("spin_r",'"__spin_r":', ','),
+        ("spin_t",'"__spin_t":', ','),
+        ("hsi",   '"hsi":', ','),
+        ("rev",   '"server_revision":', ','),
+    ]
+
+    tokens = {}
+    for key, start, end in markers:
+        if start not in html:
+            return None
+        try:
+            val = html.split(start)[1].split(end)[0].replace('"', '').strip()
+            tokens[key] = val
+        except Exception:
+            return None
+
+    # spin_b is optional – we ignore it if missing
+    if "__spin_b": in html:
+        try:
+            tokens["spin_b"] = html.split('"__spin_b":')[1].split(',')[0].replace('"', '').strip()
+        except Exception:
+            return None
+
+    return tokens
+
+def _get_jazoest(html: str) -> str | None:
+    """Extract the jazoest value from the help page."""
+    match = re.search(r'name="jazoest" value="(\d+)"', html)
+    if match:
+        return match.group(1)
+    return None
+
+# --------------------------------------------------------------------------- #
+# 6. Session setup
+# --------------------------------------------------------------------------- #
+def _setup_session(proxy: str | None = None) -> tuple[Session, str]:
+    ses = Session()
+    if proxy:
+        ses.proxies = {"http": f"http://{proxy}", "https": f"https://{proxy}"}
+    ua = get_user_agent()
+    ses.headers.update({"User-Agent": ua})
+    return ses, ua
+
+# --------------------------------------------------------------------------- #
+# 7. Instagram reporting – profile
+# --------------------------------------------------------------------------- #
+def report_profile_attack(username: str, proxy: str | None = None) -> None:
+    ses, ua = _setup_session(proxy)
+    page_headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+    }
+    report_headers = {
+        "Accept": "*/*",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Host": "help.instagram.com",
+        "Origin": "https://help.instagram.com",
+        "Referer": "https://help.instagram.com/contact/497253480400030",
+    }
+
+    try:
+        # step 1 – get the initial page to fetch js_datr and jazoest
+        r = ses.get("https://www.facebook.com/", headers=page_headers, timeout=10)
+        if r.status_code != 200 or '["_js_datr",' not in r.text:
+            raise RuntimeError("Failed to load Facebook home page")
+
+        js_datr = r.text.split('["_js_datr","')[1].split('",')[0]
+        jazoest = _get_jazoest(r.text) or "2723"  # fallback
+        tokens = _extract_tokens(r.text)
+        if not tokens:
+            raise RuntimeError("Token extraction failed")
+
+        # step 2 – open the help page to get the datr cookie
+        r = ses.get("https://help.instagram.com/contact/497253480400030",
+                    cookies={"_js_datr": js_datr},
+                    headers=page_headers,
+                    timeout=10)
+        if r.status_code != 200 or "datr" not in r.cookies:
+            raise RuntimeError("Failed to load help page")
+
+        datr = r.cookies.get("datr")
+        # The form data – most of it is static, only the tokens change
+        form = {
+            "jazoest": jazoest,
+            "lsd": tokens["lsd"],
+            "Field419623844841592": username,
+            "Field1476905342523314_iso2_country_code": "US",
+            "Field1476905342523314": "United States",
+            "support_form_id": "440963189380968",
+            "support_form_hidden_fields": '{"423417021136459":false,"419623844841592":false,"754839691215928":false,"1476905342523314":false,"284770995012493":true,"237926093076239":false}',
+            "support_form_fact_false_fields": "[]",
+            "__user": "0",
+            "__a": "1",
+            "__dyn": "7xe6Fo4SQ1PyUhxOnFwn84a2i5U4e1Fx-ey8kxx0LxW0DUeUhw5cx60Vo1upE4W0OE2WxO0SobEa81Vrzo5-0jx0Fwww6DwtU6e",
+            "__csr": "",
+            "__req": "d",
+            "__beoa": "0",
+            "__pc": "PHASED:DEFAULT",
+            "dpr": "1",
+            "__rev": tokens["rev"],
+            "__s": "5gbxno:2obi73:56i3vc",
+            "__hsi": tokens["hsi"],
+            "__comet_req": "0",
+            "__spin_r": tokens["spin_r"],
+            "__spin_b": tokens.get("spin_b", ""),
+            "__spin_t": tokens["spin_t"],
+        }
+
+        # step 3 – submit the report
+        r = ses.post("https://help.instagram.com/ajax/help/contact/submit/page",
+                     data=form,
+                     headers=report_headers,
+                     cookies={"datr": datr},
+                     timeout=10)
+        if r.status_code == 200:
+            print_success("[IG] Reported @", username, "via", proxy or "direct")
+        else:
+            print_error("[IG] Report failed (", r.status_code, ")")
+    except Exception as exc:
+        print_error("[IG] Error reporting @", username, ":", exc)
+
+# --------------------------------------------------------------------------- #
+# 8. Instagram reporting – video
+# --------------------------------------------------------------------------- #
+def report_video_attack(video_url: str, proxy: str | None = None) -> None:
+    """Same as profile attack but the form field is a video URL."""
+    ses, ua = _setup_session(proxy)
+    page_headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+    }
+    report_headers = {
+        "Accept": "*/*",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Host": "help.instagram.com",
+        "Origin": "https://help.instagram.com",
+        "Referer": "https://help.instagram.com/contact/497253480400030",
+    }
+
+    try:
+        r = ses.get("https://www.facebook.com/", headers=page_headers, timeout=10)
+        if r.status_code != 200 or '["_js_datr",' not in r.text:
+            raise RuntimeError("Failed to load Facebook home page")
+        js_datr = r.text.split('["_js_datr","')[1].split('",')[0]
+        jazoest = _get_jazoest(r.text) or "2723"
+        tokens = _extract_tokens(r.text)
+        if not tokens:
+            raise RuntimeError("Token extraction failed")
+
+        r = ses.get("https://help.instagram.com/contact/497253480400030",
+                    cookies={"_js_datr": js_datr},
+                    headers=page_headers,
+                    timeout=10)
+        if r.status_code != 200 or "datr" not in r.cookies:
+            raise RuntimeError("Failed to load help page")
+        datr = r.cookies.get("datr")
+
+        form = {
+            "jazoest": jazoest,
+            "lsd": tokens["lsd"],
+            "Field419623844841592": video_url,
+            "Field1476905342523314_iso2_country_code": "US",
+            "Field1476905342523314": "United States",
+            "support_form_id": "440963189380968",
+            "support_form_hidden_fields": '{"423417021136459":false,"419623844841592":false,"754839691215928":false,"1476905342523314":false,"284770995012493":true,"237926093076239":false}',
+            "support_form_fact_false_fields": "[]",
+            "__user": "0",
+            "__a": "1",
+            "__dyn": "7xe6Fo4SQ1PyUhxOnFwn84a2i5U4e1Fx-ey8kxx0LxW0DUeUhw5cx60Vo1upE4W0OE2WxO0SobEa81Vrzo5-0jx0Fwww6DwtU6e",
+            "__csr": "",
+            "__req": "d",
+            "__beoa": "0",
+            "__pc": "PHASED:DEFAULT",
+            "dpr": "1",
+            "__rev": tokens["rev"],
+            "__s": "5gbxno:2obi73:56i3vc",
+            "__hsi": tokens["hsi"],
+            "__comet_req": "0",
+            "__spin_r": tokens["spin_r"],
+            "__spin_b": tokens.get("spin_b", ""),
+            "__spin_t": tokens["spin_t"],
+        }
+
+        r = ses.post("https://help.instagram.com/ajax/help/contact/submit/page",
+                     data=form,
+                     headers=report_headers,
+                     cookies={"datr": datr},
+                     timeout=10)
+        if r.status_code == 200:
+            print_success("[IG] Video reported via", proxy or "direct")
+        else:
+            print_error("[IG] Video report failed (", r.status_code, ")")
+    except Exception as exc:
+        print_error("[IG] Video submission error:", exc)
+
+# --------------------------------------------------------------------------- #
+# 9. Telegram reporting – user & channel
+# --------------------------------------------------------------------------- #
+def _telegram_report(user_type: str, username: str, proxy: str | None = None) -> None:
+    ses, ua = _setup_session(proxy)
+    tg_headers = {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Connection": "keep-alive",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    try:
+        ses.get("https://telegram.org/", headers=tg_headers, timeout=10)
+
+        payload = {
+            "type": user_type,
+            "username": username,
+            "reason": "Spam and abusive behavior" if user_type == "user" else "Spam and illegal content",
+            "text": f"{user_type.title()} @{username} is violating Telegram ToS by sending unsolicited spam messages."
+                    if user_type == "user"
+                    else f"Channel @{username} is distributing spam and violating ToS.",
+        }
+
+        r = ses.post("https://telegram.org/abuse",
+                     data=payload,
+                     headers={
+                         "Content-Type": "application/x-www-form-urlencoded",
+                         "Origin": "https://telegram.org",
+                         "Referer": "https://telegram.org/abuse",
+                     },
+                     timeout=10)
+        if r.status_code in (200, 302, 303):
+            print_success("[TG] Report sent for @", username, "via", proxy or "direct")
+        else:
+            print_error("[TG] Report returned", r.status_code)
+
+        # Just visit the public page – some anti‑spam checks may need it
+        ses.get(f"https://t.me/{username}", headers=tg_headers, timeout=10)
+    except Exception as exc:
+        print_error("[TG] Report failed for @", username, ":", exc)
+
+def report_telegram_user(username: str, proxy: str | None = None) -> None:
+    _telegram_report("user", username, proxy)
+
+def report_telegram_channel(channel: str, proxy: str | None = None) -> None:
+    _telegram_report("channel", channel, proxy)
+
+# --------------------------------------------------------------------------- #
+# 10. Process helpers (to keep the main thread responsive)
+# --------------------------------------------------------------------------- #
+def _process_worker(func, *args):
+    for item in args[0]:
+        func(item, args[1])  # proxy list is passed as second argument
+        time.sleep(0.2)
+
+def profile_attack_process(username: str, proxies: list):
+    if not proxies:
+        for _ in range(10):
+            report_profile_attack(username, None)
+            time.sleep(0.3)
+        return
+    _process_worker(report_profile_attack, proxies, username)
+
+def video_attack_process(video_url: str, proxies: list):
+    if not proxies:
+        for _ in range(10):
+            report_video_attack(video_url, None)
+            time.sleep(0.3)
+        return
+    _process_worker(report_video_attack, proxies, video_url)
+
+def telegram_user_process(username: str, proxies: list):
+    if not proxies:
+        for _ in range(10):
+            report_telegram_user(username, None)
+            time.sleep(0.3)
+        return
+    _process_worker(report_telegram_user, proxies, username)
+
+def telegram_channel_process(channel: str, proxies: list):
+    if not proxies:
+        for _ in range(10):
+            report_telegram_channel(channel, None)
+            time.sleep(0.3)
+        return
+    _process_worker(report_telegram_channel, proxies, channel)
+
+# --------------------------------------------------------------------------- #
+# 11. High‑level attack orchestration
+# --------------------------------------------------------------------------- #
+def _start_processes(func, target, proxies: list):
+    chunk_list = list(chunks(proxies, 10))
+    print_status("Starting", target, "attack…")
+    for i, plist in enumerate(chunk_list, 1):
+        p = Process(target=func, args=(target, plist))
+        p.start()
+        print_status(f"{i}. Transaction opened!")
+
+def profile_attack(proxies: list):
+    username = input("Enter the Instagram username to report: ").strip()
+    if not proxies:
+        for _ in range(5):
+            p = Process(target=profile_attack_process, args=(username, []))
+            p.start()
+            print_status(f"{_ + 1}. Transaction Opened!")
+        return
+    _start_processes(profile_attack_process, username, proxies)
+
+def video_attack(proxies: list):
+    video_url = input("Enter the Instagram video URL to report: ").strip()
+    if not proxies:
+        for _ in range(5):
+            p = Process(target=video_attack_process, args=(video_url, []))
+            p.start()
+            print_status(f"{_ + 1}. Transaction Opened!")
+        return
+    _start_processes(video_attack_process, video_url, proxies)
+
+def telegram_attack(proxies: list):
+    print_status("1 - Report a user account")
+    print_status("2 - Report a channel/group")
+    choice = input("Select type (1/2): ").strip()
+    if choice == "1":
+        username = input("Enter Telegram username (without @): ").strip()
+        if not proxies:
+            for _ in range(5):
+                p = Process(target=telegram_user_process, args=(username, []))
+                p.start()
+                print_status(f"{_ + 1}. Report thread opened!")
+            return
+        _start_processes(telegram_user_process, username, proxies)
+    elif choice == "2":
+        channel = input("Enter channel username (without @): ").strip()
+        if not proxies:
+            for _ in range(5):
+                p = Process(target=telegram_channel_process, args=(channel, []))
+                p.start()
+                print_status(f"{_ + 1}. Report thread opened!")
+            return
+        _start_processes(telegram_channel_process, channel, proxies)
+    else:
+        print_error("Invalid choice!")
+        sys.exit(1)
+
+# --------------------------------------------------------------------------- #
+# 12. Proxy selection helper
+# --------------------------------------------------------------------------- #
+def get_proxies() -> list:
+    ret = input("Use proxies? [Y/N] ").strip().lower()
+    if ret == "y":
+        src = input("Collect proxies from internet? [Y/N] ").strip().lower()
+        if src == "y":
+            return find_proxies()
+        elif src == "n":
+            path = input("Enter path to proxy file: ").strip()
+            return parse_proxy_file(path)
+        else:
+            print_error("Invalid choice!")
+            sys.exit(1)
+    elif ret == "n":
+        print_status("No proxies will be used.")
+        return []
+    else:
+        print_error("Invalid choice!")
+        sys.exit(1)
+
+# --------------------------------------------------------------------------- #
+# 13. Main entry point
+# --------------------------------------------------------------------------- #
 def print_logo():
+    """Just a quick banner – you can replace it with your own art."""
     print(Fore.RED + Style.BRIGHT)
     print("  ██████  █████  ███████ █████  ██████  ███████  █████  ██████  ██████  ██████  ███████ ██████  ███████ ")
     print(" ██  ████   ███   ██   ██   ██  ██       ██    ██   ██  ██  ██      ██  ██      ██  ██       ██      ")
@@ -56,732 +566,36 @@ def print_logo():
     print(Fore.CYAN + Style.BRIGHT + "  ╚══════════════════════════════════════════════════╝")
     print(Style.RESET_ALL)
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# UTILITY FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def print_success(message, *argv):
-    print(Fore.GREEN + "[ OK ] " + Style.RESET_ALL + Style.BRIGHT, end="")
-    print(message, end=" ")
-    for arg in argv:
-        print(arg, end=" ")
-    print("")
-
-
-def print_error(message, *argv):
-    print(Fore.RED + "[ ERR ] " + Style.RESET_ALL + Style.BRIGHT, end="")
-    print(message, end=" ")
-    for arg in argv:
-        print(arg, end=" ")
-    print("")
-
-
-def print_status(message, *argv):
-    print(Fore.BLUE + "[ * ] " + Style.RESET_ALL + Style.BRIGHT, end="")
-    print(message, end=" ")
-    for arg in argv:
-        print(arg, end=" ")
-    print("")
-
-
-def ask_question(message, *argv):
-    msg = Fore.YELLOW + "[ ? ] " + Style.RESET_ALL + Style.BRIGHT + message
-    for arg in argv:
-        msg = msg + " " + arg
-    print(msg, end="")
-    ret = input(": ")
-    return ret
-
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
-    "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Linux; Android 13; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
-]
-
-
-def get_user_agent():
-    return random.choice(USER_AGENTS)
-
-
-def chunks(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i + n]
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PROXY HARVESTER
-# ═══════════════════════════════════════════════════════════════════════════════
-
-PROXY_SOURCES = [
-    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text",
-    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
-    "https://raw.githubusercontent.com/iplocate/free-proxy-list/master/proxies/all/data.txt",
-    "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/proxies/all/data.txt",
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
-    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
-    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/https.txt",
-    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
-]
-
-MAX_VALID_PROXIES = 30
-
-
-def _test_http_proxy(proxy, result_queue):
-    ua = get_user_agent()
-    try:
-        s = Session()
-        s.proxies = {"http": "http://" + proxy, "https": "http://" + proxy}
-        s.headers.update({"User-Agent": ua, "Connection": "close"})
-        resp = s.get("http://connectivitycheck.platform.hadielkadi.com/generate_204",
-                     timeout=3, allow_redirects=False)
-        if resp.status_code in (200, 204, 302, 301):
-            result_queue.put(proxy)
-        else:
-            result_queue.put(None)
-    except:
-        result_queue.put(None)
-
-
-def find_proxies():
-    proxy_set = set()
-    ua = get_user_agent()
-
-    print_status("Fetching proxies from the Internet...")
-
-    for url in PROXY_SOURCES:
-        try:
-            resp = rget(url, headers={"User-Agent": ua}, timeout=8)
-            if resp.status_code != 200:
-                continue
-            for line in resp.text.strip().splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                if "://" in line:
-                    line = line.split("://")[-1]
-                if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$', line):
-                    proxy_set.add(line)
-        except Exception:
-            pass
-
-    proxy_list = list(proxy_set)
-    random.shuffle(proxy_list)
-    print_status("Found " + str(len(proxy_list)) + " raw proxies.")
-
-    if not proxy_list:
-        print_error("No proxies found from any source!")
-        return []
-
-    print_status("Testing proxies (30 threads)...")
-    valid = []
-    to_test = proxy_list[:200]
-
-    for batch_start in range(0, len(to_test), 30):
-        batch = to_test[batch_start:batch_start + 30]
-        q = Queue()
-        threads = []
-
-        for proxy in batch:
-            t = Thread(target=_test_http_proxy, args=(proxy, q))
-            t.start()
-            threads.append(t)
-
-        for t in threads:
-            t.join(timeout=5)
-
-        while not q.empty():
-            result = q.get()
-            if result and result not in valid:
-                valid.append(result)
-                print_success("Proxy " + str(len(valid)) + "/" + str(MAX_VALID_PROXIES) + ": " + result)
-
-        if len(valid) >= MAX_VALID_PROXIES:
-            valid = valid[:MAX_VALID_PROXIES]
-            break
-
-    if not valid:
-        print_status("No valid proxies found — using raw list.")
-        valid = proxy_list[:MAX_VALID_PROXIES]
-    else:
-        valid = valid[:MAX_VALID_PROXIES]
-
-    print_status("Got " + str(len(valid)) + " working proxies.")
-    return valid
-
-
-def parse_proxy_file(fpath):
-    try:
-        with open(fpath, "r") as f:
-            proxies = []
-            for line in f.readlines():
-                line = line.strip().replace(" ", "")
-                if not line:
-                    continue
-                if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$', line):
-                    proxies.append(line)
-
-        if len(proxies) > MAX_VALID_PROXIES:
-            proxies = random.sample(proxies, MAX_VALID_PROXIES)
-
-        print("")
-        print_success(str(len(proxies)) + " proxies loaded from file!")
-        return proxies
-
-    except FileNotFoundError:
-        print("")
-        print_error("Proxy file not found! Check the path.")
-        return []
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ATTACK ENGINE — Instagram
-# ═══════════════════════════════════════════════════════════════════════════════
-
-PAGE_HEADERS = {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Encoding": "gzip, deflate",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
-    "DNT": "1",
-    "Pragma": "no-cache",
-    "Upgrade-Insecure-Requests": "1",
-}
-
-REPORT_HEADERS = {
-    "Accept": "*/*",
-    "Accept-Encoding": "gzip, deflate",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
-    "Content-Type": "application/x-www-form-urlencoded",
-    "DNT": "1",
-    "Host": "help.instagram.com",
-    "Origin": "https://help.instagram.com",
-    "Pragma": "no-cache",
-    "Referer": "https://help.instagram.com/contact/497253480400030",
-    "TE": "Trailers",
-}
-
-TG_HEADERS = {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Encoding": "gzip, deflate",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "keep-alive",
-    "Cache-Control": "no-cache",
-    "DNT": "1",
-    "Pragma": "no-cache",
-    "Upgrade-Insecure-Requests": "1",
-}
-
-
-def _setup_session(proxy):
-    ses = Session()
-    if proxy:
-        ses.proxies = {
-            "https": "https://" + proxy,
-            "http": "http://" + proxy
-        }
-    ua = get_user_agent()
-    ses.headers.update({"User-Agent": ua})
-    return ses, ua
-
-
-def _extract_tokens(text):
-    tokens = {}
-    markers = [
-        ('lsd', '["LSD",[],{"token":"', '"},'),
-        ('spin_r', '"__spin_r":', ','),
-        ('spin_t', '"__spin_t":', ','),
-        ('hsi', '"hsi":', ','),
-        ('rev', '"server_revision":', ','),
-    ]
-    for key, start, end in markers:
-        if start not in text:
-            return None
-        try:
-            val = text.split(start)[1].split(end)[0].replace('"', '').strip()
-            tokens[key] = val
-        except:
-            return None
-
-    if '"__spin_b":' in text:
-        try:
-            tokens['spin_b'] = text.split('"__spin_b":')[1].split(',')[0].replace('"', '').strip()
-        except:
-            return None
-    else:
-        return None
-
-    return tokens
-
-
-def report_profile_attack(username, proxy, report_num):
-    ses, ua = _setup_session(proxy)
-    page_h = {}
-    page_h.update(PAGE_HEADERS)
-    page_h["User-Agent"] = ua
-    report_h = {}
-    report_h.update(REPORT_HEADERS)
-    report_h["User-Agent"] = ua
-
-    try:
-        res = ses.get("https://www.facebook.com/", headers=page_h, timeout=10)
-        if res.status_code != 200 or '["_js_datr","' not in res.text:
-            print_error("[IG] Report #" + str(report_num) + " — failed to get FB cookies")
-            return
-        js_datr = res.text.split('["_js_datr","')[1].split('",')[0]
-    except:
-        print_error("[IG] Report #" + str(report_num) + " — FB cookie error")
-        return
-
-    try:
-        res = ses.get(
-            "https://help.instagram.com/contact/497253480400030",
-            cookies={"_js_datr": js_datr},
-            headers=page_h,
-            timeout=10
-        )
-        if res.status_code != 200 or "datr" not in res.cookies.get_dict():
-            print_error("[IG] Report #" + str(report_num) + " — no datr cookie")
-            return
-        datr = res.cookies.get_dict()["datr"]
-        tokens = _extract_tokens(res.text)
-        if not tokens:
-            print_error("[IG] Report #" + str(report_num) + " — token extraction failed")
-            return
-    except:
-        print_error("[IG] Report #" + str(report_num) + " — help page error")
-        return
-
-    form = {
-        "jazoest": "2723",
-        "lsd": tokens['lsd'],
-        "sneakyhidden": "",
-        "Field419623844841592": username,
-        "Field1476905342523314_iso2_country_code": "US",
-        "Field1476905342523314": "United States",
-        "support_form_id": "440963189380968",
-        "support_form_hidden_fields": '{"423417021136459":false,"419623844841592":false,"754839691215928":false,"1476905342523314":false,"284770995012493":true,"237926093076239":false}',
-        "support_form_fact_false_fields": "[]",
-        "__user": "0", "__a": "1",
-        "__dyn": "7xe6Fo4SQ1PyUhxOnFwn84a2i5U4e1Fx-ey8kxx0LxW0DUeUhw5cx60Vo1upE4W0OE2WxO0SobEa81Vrzo5-0jx0Fwww6DwtU6e",
-        "__csr": "", "__req": "d", "__beoa": "0",
-        "__pc": "PHASED:DEFAULT", "dpr": "1",
-        "__rev": tokens['rev'], "__s": "5gbxno:2obi73:56i3vc",
-        "__hsi": tokens['hsi'], "__comet_req": "0",
-        "__spin_r": tokens['spin_r'], "__spin_b": tokens['spin_b'],
-        "__spin_t": tokens['spin_t'],
-    }
-
-    try:
-        res = ses.post(
-            "https://help.instagram.com/ajax/help/contact/submit/page",
-            data=form, headers=report_h,
-            cookies={"datr": datr}, timeout=10
-        )
-        if res.status_code == 200:
-            print_success("[IG] Report #" + str(report_num) + " for @" + username + " via " + (proxy or "direct"))
-        else:
-            print_error("[IG] Report #" + str(report_num) + " failed (" + str(res.status_code) + ")")
-    except:
-        print_error("[IG] Report #" + str(report_num) + " submission error")
-
-
-def report_video_attack(video_url, proxy, report_num):
-    ses, ua = _setup_session(proxy)
-    page_h = {}
-    page_h.update(PAGE_HEADERS)
-    page_h["User-Agent"] = ua
-    report_h = {}
-    report_h.update(REPORT_HEADERS)
-    report_h["User-Agent"] = ua
-
-    try:
-        res = ses.get("https://www.facebook.com/", headers=page_h, timeout=10)
-        if res.status_code != 200 or '["_js_datr","' not in res.text:
-            print_error("[IG] Video #" + str(report_num) + " — FB cookie error")
-            return
-        js_datr = res.text.split('["_js_datr","')[1].split('",')[0]
-    except:
-        print_error("[IG] Video #" + str(report_num) + " — FB error")
-        return
-
-    try:
-        res = ses.get(
-            "https://help.instagram.com/contact/497253480400030",
-            cookies={"_js_datr": js_datr},
-            headers=page_h, timeout=10
-        )
-        if res.status_code != 200 or "datr" not in res.cookies.get_dict():
-            print_error("[IG] Video #" + str(report_num) + " — no datr")
-            return
-        datr = res.cookies.get_dict()["datr"]
-        tokens = _extract_tokens(res.text)
-        if not tokens:
-            print_error("[IG] Video #" + str(report_num) + " — token error")
-            return
-    except:
-        print_error("[IG] Video #" + str(report_num) + " — help page error")
-        return
-
-    form = {
-        "jazoest": "2723",
-        "lsd": tokens['lsd'],
-        "sneakyhidden": "",
-        "Field419623844841592": video_url,
-        "Field1476905342523314_iso2_country_code": "US",
-        "Field1476905342523314": "United States",
-        "support_form_id": "440963189380968",
-        "support_form_hidden_fields": '{"423417021136459":false,"419623844841592":false,"754839691215928":false,"1476905342523314":false,"284770995012493":true,"237926093076239":false}',
-        "support_form_fact_false_fields": "[]",
-        "__user": "0", "__a": "1",
-        "__dyn": "7xe6Fo4SQ1PyUhxOnFwn84a2i5U4e1Fx-ey8kxx0LxW0DUeUhw5cx60Vo1upE4W0OE2WxO0SobEa81Vrzo5-0jx0Fwww6DwtU6e",
-        "__csr": "", "__req": "d", "__beoa": "0",
-        "__pc": "PHASED:DEFAULT", "dpr": "1",
-        "__rev": tokens['rev'], "__s": "5gbxno:2obi73:56i3vc",
-        "__hsi": tokens['hsi'], "__comet_req": "0",
-        "__spin_r": tokens['spin_r'], "__spin_b": tokens['spin_b'],
-        "__spin_t": tokens['spin_t'],
-    }
-
-    try:
-        res = ses.post(
-            "https://help.instagram.com/ajax/help/contact/submit/page",
-            data=form, headers=report_h,
-            cookies={"datr": datr}, timeout=10
-        )
-        if res.status_code == 200:
-            print_success("[IG] Video #" + str(report_num) + " reported via " + (proxy or "direct"))
-        else:
-            print_error("[IG] Video #" + str(report_num) + " failed (" + str(res.status_code) + ")")
-    except:
-        print_error("[IG] Video #" + str(report_num) + " submission error")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ATTACK ENGINE — Telegram
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def report_telegram_user(username, proxy, report_num):
-    ses, ua = _setup_session(proxy)
-    tg_h = {}
-    tg_h.update(TG_HEADERS)
-    tg_h["User-Agent"] = ua
-
-    try:
-        ses.get("https://telegram.org/", headers=tg_h, timeout=10)
-        payload = {
-            "type": "user",
-            "username": username,
-            "reason": "Spam and abusive behavior",
-            "text": "User @" + username + " is violating Telegram ToS by sending "
-                    "unsolicited spam messages. Please take action.",
-        }
-        res = ses.post("https://telegram.org/abuse", data=payload, headers={
-            "User-Agent": ua, "Content-Type": "application/x-www-form-urlencoded",
-            "Origin": "https://telegram.org", "Referer": "https://telegram.org/abuse",
-        }, timeout=10)
-        if res.status_code in (200, 302, 303):
-            print_success("[TG] Report #" + str(report_num) + " for @" + username + " via " + (proxy or "direct"))
-        else:
-            print_error("[TG] Report #" + str(report_num) + " returned " + str(res.status_code))
-
-        ses.get("https://t.me/" + username, headers=tg_h, timeout=10)
-
-    except Exception as e:
-        print_error("[TG] Report #" + str(report_num) + " failed: " + str(e)[:40])
-
-
-def report_telegram_channel(channel, proxy, report_num):
-    ses, ua = _setup_session(proxy)
-    tg_h = {}
-    tg_h.update(TG_HEADERS)
-    tg_h["User-Agent"] = ua
-
-    try:
-        payload = {
-            "type": "channel",
-            "username": channel,
-            "reason": "Spam and illegal content",
-            "message": "Channel @" + channel + " is distributing spam and violating ToS.",
-        }
-        res = ses.post("https://telegram.org/abuse", data=payload, headers={
-            "User-Agent": ua, "Content-Type": "application/x-www-form-urlencoded",
-            "Origin": "https://telegram.org", "Referer": "https://telegram.org/abuse",
-        }, timeout=10)
-        if res.status_code in (200, 302, 303):
-            print_success("[TG] Channel #" + str(report_num) + " for @" + channel + " via " + (proxy or "direct"))
-        else:
-            print_error("[TG] Channel #" + str(report_num) + " returned " + str(res.status_code))
-    except Exception as e:
-        print_error("[TG] Channel #" + str(report_num) + " failed: " + str(e)[:40])
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# COUNTER
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class Counter:
-    def __init__(self):
-        self.val = [0]
-
-    def next(self):
-        self.val[0] += 1
-        return self.val[0]
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PROCESS MANAGEMENT
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def profile_attack_process(username, proxy_list, counter):
-    if not proxy_list:
-        for _ in range(10):
-            n = counter.next()
-            print_status("Sending IG profile report #" + str(n) + "...")
-            report_profile_attack(username, None, n)
-            sleep(0.3)
-        return
-    for proxy in proxy_list:
-        n = counter.next()
-        print_status("Sending IG profile report #" + str(n) + "...")
-        report_profile_attack(username, proxy, n)
-        sleep(0.2)
-
-
-def video_attack_process(video_url, proxy_list, counter):
-    if not proxy_list:
-        for _ in range(10):
-            n = counter.next()
-            print_status("Sending IG video report #" + str(n) + "...")
-            report_video_attack(video_url, None, n)
-            sleep(0.3)
-        return
-    for proxy in proxy_list:
-        n = counter.next()
-        print_status("Sending IG video report #" + str(n) + "...")
-        report_video_attack(video_url, proxy, n)
-        sleep(0.2)
-
-
-def telegram_user_process(username, proxy_list, counter):
-    if not proxy_list:
-        for _ in range(10):
-            n = counter.next()
-            print_status("Sending TG user report #" + str(n) + "...")
-            report_telegram_user(username, None, n)
-            sleep(0.3)
-        return
-    for proxy in proxy_list:
-        n = counter.next()
-        print_status("Sending TG user report #" + str(n) + "...")
-        report_telegram_user(username, proxy, n)
-        sleep(0.2)
-
-
-def telegram_channel_process(channel, proxy_list, counter):
-    if not proxy_list:
-        for _ in range(10):
-            n = counter.next()
-            print_status("Sending TG channel report #" + str(n) + "...")
-            report_telegram_channel(channel, None, n)
-            sleep(0.3)
-        return
-    for proxy in proxy_list:
-        n = counter.next()
-        print_status("Sending TG channel report #" + str(n) + "...")
-        report_telegram_channel(channel, proxy, n)
-        sleep(0.2)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN ATTACK FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def profile_attack(proxies):
-    username = ask_question("Enter the Instagram username to report")
-    print(Style.RESET_ALL)
-
-    total = len(proxies) if proxies else 10
-    print_status("Starting profile attack on @" + username + "...")
-    print_status("Total reports to send: " + str(total) + "\n")
-
-    counter = Counter()
-
-    if not proxies:
-        for k in range(5):
-            p = Process(target=profile_attack_process, args=(username, [], counter))
-            p.start()
-        return
-
-    chunk_list = list(chunks(proxies, 6))
-    for plist in chunk_list:
-        p = Process(target=profile_attack_process, args=(username, plist, counter))
-        p.start()
-
-
-def video_attack(proxies):
-    video_url = ask_question("Enter the Instagram video URL to report")
-    print(Style.RESET_ALL)
-
-    total = len(proxies) if proxies else 10
-    print_status("Starting video attack...")
-    print_status("Total reports to send: " + str(total) + "\n")
-
-    counter = Counter()
-
-    if not proxies:
-        for k in range(5):
-            p = Process(target=video_attack_process, args=(video_url, [], counter))
-            p.start()
-        return
-
-    chunk_list = list(chunks(proxies, 6))
-    for plist in chunk_list:
-        p = Process(target=video_attack_process, args=(video_url, plist, counter))
-        p.start()
-
-
-def telegram_attack(proxies):
-    print_status("1 - Report a user account")
-    print_status("2 - Report a channel/group")
-    choice = ask_question("Select type")
-
-    counter = Counter()
-
-    if choice == "1":
-        username = ask_question("Enter Telegram username (without @)")
-        print(Style.RESET_ALL)
-        total = len(proxies) if proxies else 10
-        print_status("Starting Telegram user attack on @" + username + "...")
-        print_status("Total reports to send: " + str(total) + "\n")
-
-        if not proxies:
-            for k in range(5):
-                p = Process(target=telegram_user_process, args=(username, [], counter))
-                p.start()
-            return
-
-        chunk_list = list(chunks(proxies, 6))
-        for plist in chunk_list:
-            p = Process(target=telegram_user_process, args=(username, plist, counter))
-            p.start()
-
-    elif choice == "2":
-        channel = ask_question("Enter channel username (without @)")
-        print(Style.RESET_ALL)
-        total = len(proxies) if proxies else 10
-        print_status("Starting Telegram channel attack on @" + channel + "...")
-        print_status("Total reports to send: " + str(total) + "\n")
-
-        if not proxies:
-            for k in range(5):
-                p = Process(target=telegram_channel_process, args=(channel, [], counter))
-                p.start()
-            return
-
-        chunk_list = list(chunks(proxies, 6))
-        for plist in chunk_list:
-            p = Process(target=telegram_channel_process, args=(channel, plist, counter))
-            p.start()
-    else:
-        print_error("Invalid choice!")
-        sys.exit(1)
-
-
-def get_proxies():
-    ret = ask_question("Use proxies? [Y/N]")
-    proxies = []
-
-    if ret.lower() == "y":
-        ret = ask_question("Collect proxies from internet? [Y/N]")
-
-        if ret.lower() == "y":
-            print_status("Gathering proxies from internet...\n")
-            proxies = find_proxies()
-        elif ret.lower() == "n":
-            file_path = ask_question("Enter path to proxy file")
-            proxies = parse_proxy_file(file_path)
-        else:
-            print_error("Invalid choice!")
-            sys.exit(1)
-
-        if proxies:
-            print_success(str(len(proxies)) + " proxies ready!\n")
-        else:
-            print_status("No proxies. Proceeding without.\n")
-
-    elif ret.lower() == "n":
-        print_status("No proxies.\n")
-    else:
-        print_error("Invalid choice!")
-        sys.exit(1)
-
-    return proxies
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN ENTRY
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def main():
-    print_success("RA-FA REPORTER loaded!\n")
-
+    print_logo()
     proxies = get_proxies()
 
-    print("")
     print_status("Select Platform:")
     print_status("1 - Instagram (report profile)")
     print_status("2 - Instagram (report video)")
     print_status("3 - Telegram (report user/channel)")
-    choice = ask_question("Select")
+    choice = input("Select (1/2/3): ").strip()
 
-    if not choice.isdigit():
-        print_error("Invalid input!")
-        sys.exit(1)
-
-    c = int(choice)
-    if c < 1 or c > 3:
+    if choice not in {"1", "2", "3"}:
         print_error("Invalid selection!")
         sys.exit(1)
 
-    if c == 1:
+    if choice == "1":
         profile_attack(proxies)
-    elif c == 2:
+    elif choice == "2":
         video_attack(proxies)
-    elif c == 3:
+    else:
         telegram_attack(proxies)
 
+    print_status("RA‑FA REPORTER finished. Press Enter to exit.")
+    input()
 
 if __name__ == "__main__":
-    print_logo()
     try:
         main()
-        print(Style.RESET_ALL)
-        print_status("RA-FA REPORTER completed. Press Enter to exit.")
-        input()
     except KeyboardInterrupt:
         print("\n" + Fore.RED + "[ * ] RA-FA REPORTER shutting down.")
-        print(Style.RESET_ALL)
         sys.exit(0)
-    except Exception as e:
-        print_error("Unhandled error: " + str(e))
-        print(Style.RESET_ALL)
+    except Exception as exc:
+        print_error("Unhandled error:", exc)
         sys.exit(1)
