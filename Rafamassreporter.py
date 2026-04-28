@@ -3,7 +3,6 @@
 
 """
 RA‑FA REPORTER v2.0 – Instagram + Telegram Mass Reporting Tool
-
 Author   : White Hack Labs
 License  : MIT
 """
@@ -20,19 +19,18 @@ from multiprocessing import Process
 from threading import Thread
 from queue import Queue
 
-# optional: if you want to colour the terminal
+# Optional colour support – falls back to plain text if missing
 try:
     from colorama import Fore, Back, Style, init as colour_init
     colour_init()
 except Exception:
-    # create dummy colour functions if colorama is missing
     class Dummy:
         def __getattr__(self, name):
             return ""
 
     Fore = Back = Style = Dummy()
 
-# requests is the only external dependency that must be present
+# Requests is the only required external dependency
 try:
     import requests
     from requests import Session, get as rget
@@ -42,7 +40,7 @@ except ImportError:
     sys.exit(1)
 
 # --------------------------------------------------------------------------- #
-# 2. Helpers – printing helpers
+# 2. Printing helpers
 # --------------------------------------------------------------------------- #
 def _print(col, prefix, *args):
     """Internal coloured printer"""
@@ -52,19 +50,14 @@ def _print(col, prefix, *args):
 def print_success(*args):  _print(Fore.GREEN, "[ OK ]", *args)
 def print_error(*args):    _print(Fore.RED,   "[ ERR ]", *args)
 def print_status(*args):   _print(Fore.BLUE,  "[ * ]", *args)
-def print_question(*args): _print(Fore.YELLOW, "[ ? ]", *args)
 
 # --------------------------------------------------------------------------- #
 # 3. User‑agent pool & utility helpers
 # --------------------------------------------------------------------------- #
 USER_AGENTS = [
-    # a short list – you can add more if you wish
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)\
- Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)\
- Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko)\
- Chrome/125.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
 ]
 def get_user_agent() -> str:
     return random.choice(USER_AGENTS)
@@ -80,7 +73,9 @@ def chunks(lst, n):
 PROXY_SOURCES = [
     "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text",
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
-    # … add more sources as needed
+    "https://raw.githubusercontent.com/iplocate/free-proxy-list/master/proxies/all/data.txt",
+    "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/proxies/all/data.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
 ]
 
 def _test_http_proxy(proxy: str, result_queue: Queue) -> None:
@@ -90,7 +85,6 @@ def _test_http_proxy(proxy: str, result_queue: Queue) -> None:
         s = Session()
         s.proxies = {"http": f"http://{proxy}", "https": f"https://{proxy}"}
         s.headers.update({"User-Agent": ua, "Connection": "close"})
-        # simple connectivity test
         resp = s.get("https://connectivitycheck.platform.hadielkadi.com/generate_204",
                      timeout=3, allow_redirects=False)
         if resp.status_code in (200, 204, 302, 301):
@@ -128,7 +122,6 @@ def find_proxies(max_proxies: int = 120, batch: int = 30) -> list:
         print_error("No proxies found.")
         return []
 
-    # Test them in batches
     print_status(f"Testing up to {max_proxies} proxies…")
     valid = []
     to_test = proxy_list[:max_proxies]
@@ -153,7 +146,6 @@ def find_proxies(max_proxies: int = 120, batch: int = 30) -> list:
         print_status("No working proxies – falling back to raw list.")
         valid = proxy_list[:50]
 
-    # keep a tidy number (multiple of 5, max 50)
     if len(valid) % 5:
         valid = valid[:len(valid) - (len(valid) % 5)]
     valid = valid[:50]
@@ -196,8 +188,8 @@ def _extract_tokens(html: str) -> dict | None:
         except Exception:
             return None
 
-    # spin_b is optional – we ignore it if missing
-    if "__spin_b": in html:
+    # Optional token – ignore if missing
+    if "__spin_b" in html:
         try:
             tokens["spin_b"] = html.split('"__spin_b":')[1].split(',')[0].replace('"', '').strip()
         except Exception:
@@ -208,9 +200,7 @@ def _extract_tokens(html: str) -> dict | None:
 def _get_jazoest(html: str) -> str | None:
     """Extract the jazoest value from the help page."""
     match = re.search(r'name="jazoest" value="(\d+)"', html)
-    if match:
-        return match.group(1)
-    return None
+    return match.group(1) if match else None
 
 # --------------------------------------------------------------------------- #
 # 6. Session setup
@@ -243,18 +233,16 @@ def report_profile_attack(username: str, proxy: str | None = None) -> None:
     }
 
     try:
-        # step 1 – get the initial page to fetch js_datr and jazoest
         r = ses.get("https://www.facebook.com/", headers=page_headers, timeout=10)
         if r.status_code != 200 or '["_js_datr",' not in r.text:
             raise RuntimeError("Failed to load Facebook home page")
 
         js_datr = r.text.split('["_js_datr","')[1].split('",')[0]
-        jazoest = _get_jazoest(r.text) or "2723"  # fallback
+        jazoest = _get_jazoest(r.text) or "2723"
         tokens = _extract_tokens(r.text)
         if not tokens:
             raise RuntimeError("Token extraction failed")
 
-        # step 2 – open the help page to get the datr cookie
         r = ses.get("https://help.instagram.com/contact/497253480400030",
                     cookies={"_js_datr": js_datr},
                     headers=page_headers,
@@ -263,7 +251,6 @@ def report_profile_attack(username: str, proxy: str | None = None) -> None:
             raise RuntimeError("Failed to load help page")
 
         datr = r.cookies.get("datr")
-        # The form data – most of it is static, only the tokens change
         form = {
             "jazoest": jazoest,
             "lsd": tokens["lsd"],
@@ -290,7 +277,6 @@ def report_profile_attack(username: str, proxy: str | None = None) -> None:
             "__spin_t": tokens["spin_t"],
         }
 
-        # step 3 – submit the report
         r = ses.post("https://help.instagram.com/ajax/help/contact/submit/page",
                      data=form,
                      headers=report_headers,
@@ -399,9 +385,9 @@ def _telegram_report(user_type: str, username: str, proxy: str | None = None) ->
             "type": user_type,
             "username": username,
             "reason": "Spam and abusive behavior" if user_type == "user" else "Spam and illegal content",
-            "text": f"{user_type.title()} @{username} is violating Telegram ToS by sending unsolicited spam messages."
-                    if user_type == "user"
-                    else f"Channel @{username} is distributing spam and violating ToS.",
+            "text": (f"User @{username} is violating Telegram ToS by sending unsolicited spam messages."
+                     if user_type == "user"
+                     else f"Channel @{username} is distributing spam and violating ToS."),
         }
 
         r = ses.post("https://telegram.org/abuse",
@@ -417,7 +403,6 @@ def _telegram_report(user_type: str, username: str, proxy: str | None = None) ->
         else:
             print_error("[TG] Report returned", r.status_code)
 
-        # Just visit the public page – some anti‑spam checks may need it
         ses.get(f"https://t.me/{username}", headers=tg_headers, timeout=10)
     except Exception as exc:
         print_error("[TG] Report failed for @", username, ":", exc)
@@ -431,9 +416,10 @@ def report_telegram_channel(channel: str, proxy: str | None = None) -> None:
 # --------------------------------------------------------------------------- #
 # 10. Process helpers (to keep the main thread responsive)
 # --------------------------------------------------------------------------- #
-def _process_worker(func, *args):
-    for item in args[0]:
-        func(item, args[1])  # proxy list is passed as second argument
+def _process_worker(func, items, proxies):
+    """Execute *func(item, proxy)* for each item in *items*."""
+    for item in items:
+        func(item, proxies[0] if proxies else None)
         time.sleep(0.2)
 
 def profile_attack_process(username: str, proxies: list):
@@ -442,7 +428,7 @@ def profile_attack_process(username: str, proxies: list):
             report_profile_attack(username, None)
             time.sleep(0.3)
         return
-    _process_worker(report_profile_attack, proxies, username)
+    _process_worker(report_profile_attack, proxies, proxies)
 
 def video_attack_process(video_url: str, proxies: list):
     if not proxies:
@@ -450,7 +436,7 @@ def video_attack_process(video_url: str, proxies: list):
             report_video_attack(video_url, None)
             time.sleep(0.3)
         return
-    _process_worker(report_video_attack, proxies, video_url)
+    _process_worker(report_video_attack, proxies, proxies)
 
 def telegram_user_process(username: str, proxies: list):
     if not proxies:
@@ -458,7 +444,7 @@ def telegram_user_process(username: str, proxies: list):
             report_telegram_user(username, None)
             time.sleep(0.3)
         return
-    _process_worker(report_telegram_user, proxies, username)
+    _process_worker(report_telegram_user, proxies, proxies)
 
 def telegram_channel_process(channel: str, proxies: list):
     if not proxies:
@@ -466,7 +452,7 @@ def telegram_channel_process(channel: str, proxies: list):
             report_telegram_channel(channel, None)
             time.sleep(0.3)
         return
-    _process_worker(report_telegram_channel, proxies, channel)
+    _process_worker(report_telegram_channel, proxies, proxies)
 
 # --------------------------------------------------------------------------- #
 # 11. High‑level attack orchestration
@@ -551,7 +537,7 @@ def get_proxies() -> list:
 # 13. Main entry point
 # --------------------------------------------------------------------------- #
 def print_logo():
-    """Just a quick banner – you can replace it with your own art."""
+    """Quick ASCII banner – replace or keep."""
     print(Fore.RED + Style.BRIGHT)
     print("  ██████  █████  ███████ █████  ██████  ███████  █████  ██████  ██████  ██████  ███████ ██████  ███████ ")
     print(" ██  ████   ███   ██   ██   ██  ██       ██    ██   ██  ██  ██      ██  ██      ██  ██       ██      ")
@@ -594,7 +580,7 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n" + Fore.RED + "[ * ] RA-FA REPORTER shutting down.")
+        print("\n" + Fore.RED + "[ * ] RA‑FA REPORTER shutting down.")
         sys.exit(0)
     except Exception as exc:
         print_error("Unhandled error:", exc)
