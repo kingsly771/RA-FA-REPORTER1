@@ -51,8 +51,8 @@ BLOKS_VERSION_IDS = [
 # --- Telegram API credentials (REQUIRED: get from https://my.telegram.org) ---
 # You MUST replace these with YOUR OWN api_id and api_hash from my.telegram.org
 # This is a one-time setup — the session will be saved after first login.
-TG_API_ID = 12345          # <-- CHANGE THIS to your actual api_id
-TG_API_HASH = "your_api_hash_here"  # <-- CHANGE THIS to your actual api_hash
+TG_API_ID = 32210514          # <-- CHANGE THIS to your actual api_id
+TG_API_HASH = "503a3f7ac63b84c78232df3a48643701"  # <-- CHANGE THIS to your actual api_hash
 
 # ============================================================
 # PROXY FETCHING ENGINE
